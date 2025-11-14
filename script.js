@@ -16,11 +16,52 @@ const COLORS = [
   "#38bdf8"
 ];
 
+const isAppleMobile = /iPad|iPhone|iPod/.test(navigator.userAgent);
+const backendPreference = isAppleMobile
+  ? ["wasm", "webgl", "cpu"]
+  : ["webgl", "wasm", "cpu"];
+let backendInUse = null;
+
 const setStatus = (message, isError = false) => {
   statusEl.textContent = message;
   statusEl.style.background = isError
     ? "rgba(239, 68, 68, 0.85)"
     : "rgba(0, 0, 0, 0.65)";
+};
+
+const hasBackend = (name) => {
+  if (typeof tf.findBackendFactory === "function") {
+    return Boolean(tf.findBackendFactory(name));
+  }
+  const engine = typeof tf.engine === "function" ? tf.engine() : undefined;
+  return Boolean(engine?.registryFactory?.[name]);
+};
+
+const configureWasmBackend = () => {
+  if (tf.wasm?.setWasmPaths) {
+    tf.wasm.setWasmPaths(
+      "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.20.0/dist/"
+    );
+  }
+};
+
+const initializeBackend = async () => {
+  configureWasmBackend();
+  for (const backend of backendPreference) {
+    if (!hasBackend(backend)) continue;
+    try {
+      await tf.setBackend(backend);
+      await tf.ready();
+      backendInUse = backend;
+      return backend;
+    } catch (error) {
+      console.warn(`No se pudo iniciar el backend ${backend}`, error);
+    }
+  }
+
+  throw new Error(
+    "TensorFlow.js no pudo inicializarse (WebGL/WASM/CPU no disponibles)."
+  );
 };
 
 const resizeCanvasToVideo = () => {
@@ -78,6 +119,36 @@ const drawDetections = (predictions) => {
   });
 };
 
+const switchToNextBackend = async () => {
+  const currentIndex = backendPreference.indexOf(backendInUse);
+  const candidates = backendPreference.slice(currentIndex + 1);
+
+  for (const backend of candidates) {
+    if (!hasBackend(backend)) continue;
+    try {
+      configureWasmBackend();
+      setStatus(
+        `Compatibilidad limitada. Activando backend ${backend.toUpperCase()}…`
+      );
+      await tf.setBackend(backend);
+      await tf.ready();
+      backendInUse = backend;
+      if (typeof model?.dispose === "function") {
+        model.dispose();
+      }
+      model = await cocoSsd.load();
+      detectionActive = true;
+      setStatus(`Backend ${backend.toUpperCase()} activo. Detectando objetos…`);
+      requestAnimationFrame(detectionLoop);
+      return true;
+    } catch (backendError) {
+      console.warn(`No se pudo activar el backend ${backend}`, backendError);
+    }
+  }
+
+  return false;
+};
+
 const detectionLoop = async () => {
   if (!detectionActive || !model) return;
 
@@ -91,8 +162,14 @@ const detectionLoop = async () => {
     );
   } catch (error) {
     console.error("Error durante la detección:", error);
-    setStatus("Error en la detección. Revisa la consola.", true);
     detectionActive = false;
+    const recovered = await switchToNextBackend();
+    if (!recovered) {
+      setStatus(
+        error?.message || "Error en la detección. Revisa la consola.",
+        true
+      );
+    }
     return;
   }
 
@@ -104,7 +181,12 @@ const init = async () => {
     setStatus("Solicitando acceso a la cámara…");
     await startCamera();
 
-    setStatus("Cargando modelo COCO-SSD…");
+    setStatus("Inicializando TensorFlow.js…");
+    const backend = await initializeBackend();
+
+    setStatus(
+      `Backend ${backend.toUpperCase()} listo. Cargando modelo COCO-SSD…`
+    );
     model = await cocoSsd.load();
 
     setStatus("Detectando objetos…");
